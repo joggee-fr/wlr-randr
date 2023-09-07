@@ -20,7 +20,9 @@ wayland_scanner_client = generator(
 )
 
 client_protocols = [
+	['wayland.xml'],
 	['wlr-output-management-unstable-v1.xml'],
+	['wlr-output-power-management-unstable-v1.xml'],
 ]
 
 client_protos_src = []

@@ -8,7 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wayland-client.h>
+#include "wayland-client-protocol.h"
 #include "wlr-output-management-unstable-v1-client-protocol.h"
+#include "wlr-output-power-management-unstable-v1-client-protocol.h"
 
 struct randr_state;
 struct randr_head;
@@ -45,13 +47,28 @@ struct randr_head {
 	enum zwlr_output_head_v1_adaptive_sync_state adaptive_sync_state;
 };
 
+struct randr_output {
+	struct randr_state *state;
+	struct wl_output *wl_output;
+	struct wl_list link;
+
+	char *name;
+	struct zwlr_output_power_v1 *output_power;
+	enum zwlr_output_power_v1_mode power_mode;
+	bool set_power_mode;
+};
+
 struct randr_state {
 	struct zwlr_output_manager_v1 *output_manager;
+	struct zwlr_output_power_manager_v1 *output_power_manager;
 
 	struct wl_list heads;
 	uint32_t serial;
 	bool running;
 	bool failed;
+
+	struct wl_list outputs;
+	int output_count;
 };
 
 static const char *output_transform_map[] = {
@@ -64,6 +81,17 @@ static const char *output_transform_map[] = {
 	[WL_OUTPUT_TRANSFORM_FLIPPED_180] = "flipped-180",
 	[WL_OUTPUT_TRANSFORM_FLIPPED_270] = "flipped-270",
 };
+
+static void print_output_power(struct randr_head *head) {
+	struct randr_output *output;
+	wl_list_for_each(output, &head->state->outputs, link) {
+		if (strcmp(output->name, head->name) == 0) {
+			printf("  Power: %s\n",
+				output->power_mode == ZWLR_OUTPUT_POWER_V1_MODE_ON ?
+				"on" : "off");
+		}
+	}
+}
 
 static void print_state(struct randr_state *state) {
 	struct randr_head *head;
@@ -82,6 +110,7 @@ static void print_state(struct randr_state *state) {
 		}
 
 		printf("  Enabled: %s\n", head->enabled ? "yes" : "no");
+		print_output_power(head);
 
 		if (!wl_list_empty(&head->modes)) {
 			printf("  Modes:\n");
@@ -165,6 +194,18 @@ static const struct zwlr_output_configuration_v1_listener config_listener = {
 	.cancelled = config_handle_cancelled,
 };
 
+static void apply_output_power(struct randr_head *head) {
+	struct randr_output *output;
+	wl_list_for_each(output, &head->state->outputs, link) {
+		if (strcmp(output->name, head->name) == 0) {
+			if (output->set_power_mode) {
+  				zwlr_output_power_v1_set_mode(output->output_power,
+					output->power_mode);
+			}
+		}
+	}
+}
+
 static void apply_state(struct randr_state *state, bool dry_run) {
 	struct zwlr_output_configuration_v1 *config =
 		zwlr_output_manager_v1_create_configuration(state->output_manager,
@@ -199,6 +240,8 @@ static void apply_state(struct randr_state *state, bool dry_run) {
 			zwlr_output_configuration_head_v1_set_adaptive_sync(config_head,
 				head->adaptive_sync_state);
 		}
+
+		apply_output_power(head);
 	}
 
 	if (dry_run) {
@@ -408,6 +451,73 @@ static const struct zwlr_output_manager_v1_listener output_manager_listener = {
 	.finished = output_manager_handle_finished,
 };
 
+static void output_handle_geometry(void *data, struct wl_output *wl_output,
+		int32_t x, int32_t y, int32_t physical_width, int32_t physical_height,
+		int32_t subpixel, const char *make, const char *model,
+		int32_t transform) {
+	// This space is intentionally left blank
+}
+
+static void output_handle_mode(void *data, struct wl_output *wl_output,
+		uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
+	// This space is intentionally left blank
+}
+
+static void output_handle_done(void *data, struct wl_output *wl_output) {
+	struct randr_output *output = data;
+	output->state->output_count++;
+}
+
+static void output_handle_scale(void *data, struct wl_output *wl_output,
+		int32_t factor) {
+	// This space is intentionally left blank
+}
+
+static void output_handle_name(void *data, struct wl_output *wl_output,
+		const char *name) {
+	struct randr_output *output = data;
+	fprintf(stderr, "OUTPUT %s\n", name);
+	output->name = strdup(name);
+}
+
+static void output_handle_description(void *data, struct wl_output *wl_output,
+		const char *description) {
+	// This space is intentionally left blank
+}
+
+static const struct wl_output_listener output_listener =
+{
+	.geometry = output_handle_geometry,
+	.mode = output_handle_mode,
+	.done = output_handle_done,
+	.scale = output_handle_scale,
+	.name = output_handle_name,
+	.description = output_handle_description,
+};
+
+static void output_power_handle_mode(void *data,
+		struct zwlr_output_power_v1 *output_power,
+		enum zwlr_output_power_v1_mode mode)
+{
+	struct randr_output *output = data;
+	output->power_mode = mode;
+	output->state->output_count++;
+}
+
+static void output_power_handle_failed(void *data,
+		struct zwlr_output_power_v1 *output_power)
+{
+	struct randr_output *output = data;
+	fprintf(stderr, "failed to retrieve output power\n");
+	output->state->output_count = -1;
+}
+
+
+static const struct zwlr_output_power_v1_listener output_power_listener = {
+	.mode = output_power_handle_mode,
+	.failed = output_power_handle_failed,
+};
+
 static void registry_handle_global(void *data, struct wl_registry *registry,
 		uint32_t name, const char *interface, uint32_t version) {
 	struct randr_state *state = data;
@@ -418,6 +528,18 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
 			&zwlr_output_manager_v1_interface, version_to_bind);
 		zwlr_output_manager_v1_add_listener(state->output_manager,
 			&output_manager_listener, state);
+	} else if (strcmp(interface, zwlr_output_power_manager_v1_interface.name) == 0) {
+		state->output_power_manager = wl_registry_bind(registry, name,
+			&zwlr_output_power_manager_v1_interface, 1);
+	}  else if (strcmp(interface, wl_output_interface.name) == 0) {
+		uint32_t version_to_bind = version <= 4 ? version : 4;
+		struct wl_output *wl_output = wl_registry_bind(registry, name,
+			&wl_output_interface, version_to_bind);
+		struct randr_output *output = calloc(1, sizeof(*output));
+		output->state = state;
+		output->wl_output = wl_output;
+		wl_list_insert(state->outputs.prev, &output->link);
+		wl_output_add_listener(wl_output, &output_listener, output);
 	}
 }
 
@@ -445,6 +567,8 @@ static const struct option long_options[] = {
 	{"transform", required_argument, 0, 0},
 	{"scale", required_argument, 0, 0},
 	{"adaptive-sync", required_argument, 0, 0},
+	{"power-on", no_argument, 0, 0},
+	{"power-off", no_argument, 0, 0},
 	{0},
 };
 
@@ -519,6 +643,17 @@ static void fixup_disabled_head(struct randr_head *head) {
 		if (!wl_list_empty(&head->modes)) {
 			head->mode = wl_container_of(head->modes.next,
 					mode, link);
+		}
+	}
+}
+
+static void save_output_power(struct randr_head *head, bool on) {
+	struct randr_output *output;
+	wl_list_for_each(output, &head->state->outputs, link) {
+		if (strcmp(output->name, head->name) == 0) {
+			output->power_mode = on ?
+				ZWLR_OUTPUT_POWER_V1_MODE_ON : ZWLR_OUTPUT_POWER_V1_MODE_OFF;
+			output->set_power_mode = true;
 		}
 	}
 }
@@ -649,6 +784,10 @@ static bool parse_output_arg(struct randr_head *head,
 			fprintf(stderr, "invalid adaptive sync state: %s\n", value);
 			return false;
 		}
+	} else if (strcmp(name, "power-on") == 0) {
+		save_output_power(head, true);
+	} else if (strcmp(name, "power-off") == 0) {
+		save_output_power(head, false);
 	} else {
 		fprintf(stderr, "invalid option: %s\n", name);
 		return false;
@@ -670,11 +809,14 @@ static const char usage[] =
 	"  --pos <x>,<y>\n"
 	"  --transform normal|90|180|270|flipped|flipped-90|flipped-180|flipped-270\n"
 	"  --scale <factor>\n"
-	"  --adaptive-sync enabled|disabled\n";
+	"  --adaptive-sync enabled|disabled\n"
+	"  --power-on\n"
+	"  --power-off\n";
 
 int main(int argc, char *argv[]) {
 	struct randr_state state = { .running = true };
 	wl_list_init(&state.heads);
+	wl_list_init(&state.outputs);
 
 	struct wl_display *display = wl_display_connect(NULL);
 	if (display == NULL) {
@@ -693,9 +835,43 @@ int main(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 
+	if (state.output_power_manager) {
+		int count = wl_list_length(&state.outputs);
+		if (count > 0) {
+			while (state.output_count < count) {
+				if (wl_display_dispatch(display) < 0) {
+					fprintf(stderr, "wl_display_dispatch failed\n");
+					return EXIT_FAILURE;
+				}
+			}
+
+			struct randr_output *output;
+			state.output_count = 0;
+			wl_list_for_each(output, &state.outputs, link) {
+				output->output_power =
+					zwlr_output_power_manager_v1_get_output_power(
+						state.output_power_manager, output->wl_output);
+				zwlr_output_power_v1_add_listener(output->output_power,
+					&output_power_listener, output);
+			}
+
+			while (state.output_count < count && state.output_count != -1) {
+				if (wl_display_dispatch(display) < 0) {
+					fprintf(stderr, "wl_display_dispatch failed\n");
+					return EXIT_FAILURE;
+				}
+			}
+
+			if (state.output_count == -1) {
+				fprintf(stderr, "here?\n");
+				return EXIT_FAILURE;
+			}
+		}
+	}
+
 	while (state.serial == 0) {
 		if (wl_display_dispatch(display) < 0) {
-			fprintf(stderr, "wl_display_dispatch failed\n");
+			fprintf(stderr, "failed t failed\n");
 			return EXIT_FAILURE;
 		}
 	}
